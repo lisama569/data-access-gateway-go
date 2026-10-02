@@ -157,3 +157,189 @@ func TestVerdictDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// sensitivityPolicy 构造按分级分段的策略：
+// public/internal 允许明文；confidential 需脱敏；restricted 显式拒绝。
+func sensitivityPolicy() model.Policy {
+	ptr := func(s model.Sensitivity) *model.Sensitivity { return &s }
+	return model.Policy{
+		Version:     "v-sens",
+		EffectiveAt: t0.AddDate(-1, 0, 0),
+		Rules: []model.Rule{
+			{
+				Resources: []string{"res:1"}, Purposes: []string{"research"},
+				MinSensitivity: ptr(model.SensitivityPublic), MaxSensitivity: ptr(model.SensitivityInternal),
+				Effect: model.EffectAllow,
+			},
+			{
+				Resources: []string{"res:1"}, Purposes: []string{"research"},
+				MinSensitivity: ptr(model.SensitivityConfidential), MaxSensitivity: ptr(model.SensitivityConfidential),
+				Effect:     model.EffectMask,
+				FieldRules: []model.FieldRule{{Field: "name", Transform: "mask"}},
+			},
+			{
+				Resources: []string{"res:1"}, Purposes: []string{"research"},
+				MinSensitivity: ptr(model.SensitivityRestricted), MaxSensitivity: ptr(model.SensitivityRestricted),
+				Effect: model.EffectDeny,
+			},
+		},
+	}
+}
+
+// 同一数据/主体/目的/策略版本，只调数据分级，结论必须随之变严。
+func TestSensitivityLevelChangesDecision(t *testing.T) {
+	store := fakeStore{pols: map[string]model.Policy{"v-sens": sensitivityPolicy()}}
+	e := NewEngine(store, func() time.Time { return t0 })
+
+	cases := []struct {
+		level  model.Sensitivity
+		wantD  model.Decision
+		wantR  model.Reason
+	}{
+		{model.SensitivityPublic, model.DecisionAllow, model.ReasonNone},
+		{model.SensitivityInternal, model.DecisionAllow, model.ReasonNone},
+		{model.SensitivityConfidential, model.DecisionMask, model.ReasonNone},
+		{model.SensitivityRestricted, model.DecisionDeny, model.ReasonRuleDenied},
+	}
+	var prev model.Decision
+	for i, tc := range cases {
+		rec := &model.Record{Resource: "res:1", Sensitivity: tc.level}
+		req := baseReq(validGrant())
+		d, reason, pol, basis := e.Verdict(req, rec)
+		t.Logf("[level=%s] input={subject=u1 resource=res:1 purpose=research level=%s policy=%s} decision=%d reason=%q factors=%v",
+			tc.level, tc.level, pol.Version, d, reason, basis.Factors)
+		if d != tc.wantD || reason != tc.wantR {
+			t.Fatalf("level %s: got d=%d reason=%q, want d=%d reason=%q",
+				tc.level, d, reason, tc.wantD, tc.wantR)
+		}
+		// 枚举序 Deny(0) < Mask(1) < Allow(2)：数值变大意味着变宽松。
+		if i > 0 && d > prev {
+			t.Fatalf("decision must not get more permissive as sensitivity rises: %d -> %d", prev, d)
+		}
+		prev = d
+	}
+
+	// 验收红线：最低档与最高档结论必须不同（不能还是原来的结论）。
+	loRec := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityPublic}
+	hiRec := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityRestricted}
+	lo, loReason, _, _ := e.Verdict(baseReq(validGrant()), loRec)
+	hi, hiReason, _, _ := e.Verdict(baseReq(validGrant()), hiRec)
+	if lo == hi && loReason == hiReason {
+		t.Fatalf("lowest and highest sensitivity must yield distinguishable conclusions, both = %d %q", lo, loReason)
+	}
+}
+
+// 分级落在所有规则覆盖范围之外时，必须拒绝且不能误命中后面的允许规则。
+func TestSensitivityOutOfScopeNoBypass(t *testing.T) {
+	ptr := func(s model.Sensitivity) *model.Sensitivity { return &s }
+	p := model.Policy{
+		Version:     "v-scope",
+		EffectiveAt: t0.AddDate(-1, 0, 0),
+		Rules: []model.Rule{
+			// 只覆盖最低两级。
+			{
+				Resources: []string{"res:1"}, Purposes: []string{"research"},
+				MinSensitivity: ptr(model.SensitivityPublic), MaxSensitivity: ptr(model.SensitivityInternal),
+				Effect: model.EffectMask,
+				FieldRules: []model.FieldRule{{Field: "name", Transform: "mask"}},
+			},
+			// 陷阱：一条通配允许规则也只声明覆盖低档，高档数据绝不能借它放行。
+			{
+				Resources: []string{"*"}, Purposes: []string{"*"},
+				MinSensitivity: ptr(model.SensitivityPublic), MaxSensitivity: ptr(model.SensitivityConfidential),
+				Effect: model.EffectAllow,
+			},
+		},
+	}
+	store := fakeStore{pols: map[string]model.Policy{"v-scope": p}}
+	e := NewEngine(store, func() time.Time { return t0 })
+
+	// 低档仍按第一条规则脱敏。
+	low := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityInternal}
+	d, reason, _, basis := e.Verdict(baseReq(validGrant()), low)
+	t.Logf("[in-scope level=internal] decision=%d reason=%q factors=%v", d, reason, basis.Factors)
+	if d != model.DecisionMask {
+		t.Fatalf("in-scope low level got d=%d, want mask", d)
+	}
+
+	// 最高档超出两条规则的覆盖区间：必须拒绝为 SENSITIVITY_OUT_OF_SCOPE，
+	// 且绝不能被第二条通配 allow 放行。
+	high := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityRestricted}
+	d, reason, _, basis = e.Verdict(baseReq(validGrant()), high)
+	t.Logf("[out-of-scope level=restricted] decision=%d reason=%q factors=%v", d, reason, basis.Factors)
+	if d != model.DecisionDeny || reason != model.ReasonSensitivityOutOfScope {
+		t.Fatalf("out-of-scope high level got d=%d reason=%q, want deny SENSITIVITY_OUT_OF_SCOPE", d, reason)
+	}
+}
+
+// 规则未声明分级区间时，任何分级都适用——存量策略语义保持不变。
+func TestRuleWithoutSensitivityMatchesAllLevels(t *testing.T) {
+	store := fakeStore{pols: map[string]model.Policy{"v1": testPolicy()}} // 规则无分级声明
+	e := NewEngine(store, func() time.Time { return t0 })
+	for _, level := range []model.Sensitivity{
+		model.SensitivityPublic, model.SensitivityInternal,
+		model.SensitivityConfidential, model.SensitivityRestricted,
+	} {
+		rec := &model.Record{Resource: "res:1", Sensitivity: level}
+		d, reason, _, basis := e.Verdict(baseReq(validGrant()), rec)
+		t.Logf("[legacy rule level=%s] decision=%d reason=%q factors=%v", level, d, reason, basis.Factors)
+		if d != model.DecisionMask || reason != model.ReasonNone {
+			t.Fatalf("legacy rule must ignore sensitivity, level=%s got d=%d reason=%q", level, d, reason)
+		}
+	}
+}
+
+// 授权声明分级上限：超过上限一律拒绝，原因码必须与其他拒绝可区分。
+func TestGrantSensitivityCap(t *testing.T) {
+	store := fakeStore{pols: map[string]model.Policy{"v1": testPolicy()}} // 规则不按分级筛选
+	e := NewEngine(store, func() time.Time { return t0 })
+	capLevel := model.SensitivityConfidential
+
+	// 分级恰好等于上限（闭区间）：不触发上限拒绝，正常走规则结论。
+	atCap := baseReq(validGrant())
+	atCap.Grant.MaxSensitivity = &capLevel
+	rec := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityConfidential}
+	d, reason, _, basis := e.Verdict(atCap, rec)
+	t.Logf("[at-cap level=confidential] decision=%d reason=%q factors=%v", d, reason, basis.Factors)
+	if d != model.DecisionMask || reason != model.ReasonNone {
+		t.Fatalf("level at cap got d=%d reason=%q, want mask", d, reason)
+	}
+
+	// 分级高于上限：拒绝，且原因码独立可区分。
+	over := baseReq(validGrant())
+	over.Grant.MaxSensitivity = &capLevel
+	recHigh := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityRestricted}
+	d, reason, _, basis = e.Verdict(over, recHigh)
+	t.Logf("[over-cap level=restricted] decision=%d reason=%q factors=%v", d, reason, basis.Factors)
+	if d != model.DecisionDeny || reason != model.ReasonGrantSensitivityCap {
+		t.Fatalf("over cap got d=%d reason=%q, want GRANT_SENSITIVITY_EXCEEDED", d, reason)
+	}
+	for _, other := range []model.Reason{
+		model.ReasonGrantMissing, model.ReasonGrantRevoked, model.ReasonPurposeMismatch,
+		model.ReasonClearanceInsufficient, model.ReasonSensitivityOutOfScope,
+	} {
+		if reason == other {
+			t.Fatalf("grant cap reason must be distinct from %q", other)
+		}
+	}
+}
+
+// 存量授权（未声明上限）在任意分级下行为不变，不因扩展被改变结论。
+func TestLegacyGrantWithoutCapUnaffected(t *testing.T) {
+	store := fakeStore{pols: map[string]model.Policy{"v1": testPolicy()}}
+	e := NewEngine(store, func() time.Time { return t0 })
+	g := validGrant() // MaxSensitivity == nil
+	if g.MaxSensitivity != nil {
+		t.Fatal("setup: legacy grant must have nil cap")
+	}
+	for _, level := range []model.Sensitivity{
+		model.SensitivityPublic, model.SensitivityInternal,
+		model.SensitivityConfidential, model.SensitivityRestricted,
+	} {
+		rec := &model.Record{Resource: "res:1", Sensitivity: level}
+		d, reason, _, _ := e.Verdict(baseReq(validGrant()), rec)
+		if d != model.DecisionMask || reason != model.ReasonNone {
+			t.Fatalf("legacy grant changed at level=%s: d=%d reason=%q", level, d, reason)
+		}
+	}
+}

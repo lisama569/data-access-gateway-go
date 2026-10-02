@@ -6,9 +6,14 @@
 //     NO_APPLICABLE_POLICY。
 //  2. 授权存在性：缺失 GRANT_MISSING；已撤销 GRANT_REVOKED；过期按缺失处理。
 //  3. 数据保留期：记录超出保留期 DATA_RETENTION_EXPIRED。
-//  4. 目的匹配：授权目的与策略规则目的均须匹配，否则 PURPOSE_MISMATCH。
-//  5. 密级：低于规则要求 CLEARANCE_INSUFFICIENT。
-//  6. 规则效果：按规则顺序取第一条匹配规则的 deny/mask/allow。
+//  4. 授权分级上限：数据分级超过授权声明的 MaxSensitivity 时
+//     GRANT_SENSITIVITY_EXCEEDED；授权未声明上限则跳过（存量授权语义不变）。
+//  5. 目的匹配：授权目的与策略规则目的均须匹配，否则 PURPOSE_MISMATCH。
+//  6. 密级：低于规则要求 CLEARANCE_INSUFFICIENT。
+//  7. 规则分级范围：规则可声明 [MinSensitivity, MaxSensitivity] 适用区间，
+//     数据分级不在区间内的规则被跳过；无任何规则覆盖该分级时
+//     SENSITIVITY_OUT_OF_SCOPE；规则未声明区间则不按分级筛选（存量策略语义不变）。
+//  8. 规则效果：按规则顺序取第一条匹配规则的 deny/mask/allow。
 package pdp
 
 import (
@@ -58,6 +63,32 @@ func matchAny(list []string, v string) bool {
 		return true
 	}
 	return contains(list, v)
+}
+
+// sensitivityInScope 判断数据分级是否落入规则声明的适用区间。
+// 两侧边界均为 nil 表示规则不按分级筛选（存量策略语义）。
+func sensitivityInScope(level model.Sensitivity, min, max *model.Sensitivity) bool {
+	if min != nil && level < *min {
+		return false
+	}
+	if max != nil && level > *max {
+		return false
+	}
+	return true
+}
+
+// sensitivityRangeText 生成规则分级区间的可读文本，用于判定依据日志。
+func sensitivityRangeText(min, max *model.Sensitivity) string {
+	switch {
+	case min == nil && max == nil:
+		return "any"
+	case min == nil:
+		return "<=" + max.String()
+	case max == nil:
+		return ">=" + min.String()
+	default:
+		return min.String() + ".." + max.String()
+	}
 }
 
 // selectPolicy 选择判定所用策略版本。
@@ -131,15 +162,42 @@ func (e *Engine) Verdict(req model.AccessRequest, rec *model.Record) (model.Deci
 		return deny(model.ReasonDataRetentionExpired, p)
 	}
 
+	// 授权分级上限：仅在授权显式声明 MaxSensitivity 时生效；
+	// 未声明（nil）的存量授权一律跳过本检查，行为与扩展前一致。
+	if rec != nil {
+		basis.Factors = append(basis.Factors, "data:sensitivity="+rec.Sensitivity.String())
+		if req.Grant.MaxSensitivity != nil {
+			basis.Factors = append(basis.Factors, "grant:max_sensitivity="+req.Grant.MaxSensitivity.String())
+			if rec.Sensitivity > *req.Grant.MaxSensitivity {
+				basis.Factors = append(basis.Factors, "grant:sensitivity_exceeded")
+				return deny(model.ReasonGrantSensitivityCap, p)
+			}
+			basis.Factors = append(basis.Factors, "grant:sensitivity_within_cap")
+		}
+	}
+
 	// 授权目的必须覆盖本次访问目的。
 	if !matchAny(req.Grant.Purposes, req.Purpose) {
 		basis.Factors = append(basis.Factors, "grant:purposes_mismatch")
 		return deny(model.ReasonPurposeMismatch, p)
 	}
 
-	// 规则匹配：取第一条资源与目的均匹配的规则。
+	// 规则匹配：按顺序取第一条「资源 + 分级 + 目的」均匹配的规则。
+	// 分级不在规则声明区间内时跳过该规则继续向后找；这样分级超出某条规则
+	// 覆盖范围时不会误命中它后面的允许规则——后者若也不覆盖该分级同样会被跳过，
+	// 最终落到 SENSITIVITY_OUT_OF_SCOPE 拒绝。
+	resourceMatched := false
 	for i, rule := range p.Rules {
 		if !matchAny(rule.Resources, req.Resource) {
+			continue
+		}
+		resourceMatched = true
+		if rec != nil && !sensitivityInScope(rec.Sensitivity, rule.MinSensitivity, rule.MaxSensitivity) {
+			basis.Factors = append(basis.Factors,
+				"rule:index="+itoa(i),
+				"rule:sensitivity_scope="+sensitivityRangeText(rule.MinSensitivity, rule.MaxSensitivity),
+				"rule:sensitivity_skipped",
+			)
 			continue
 		}
 		if !matchAny(rule.Purposes, req.Purpose) {
@@ -167,6 +225,11 @@ func (e *Engine) Verdict(req model.AccessRequest, rec *model.Record) (model.Deci
 			basis.Factors = append(basis.Factors, "decision:allow")
 			return model.DecisionAllow, model.ReasonNone, p, basis
 		}
+	}
+	if resourceMatched {
+		// 有规则针对该资源，但数据分级不落入任何一条规则的覆盖区间。
+		basis.Factors = append(basis.Factors, "rule:sensitivity_out_of_scope")
+		return deny(model.ReasonSensitivityOutOfScope, p)
 	}
 	basis.Factors = append(basis.Factors, "rule:no_match")
 	return deny(model.ReasonNoApplicablePolicy, p)

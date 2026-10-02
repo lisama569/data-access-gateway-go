@@ -13,6 +13,22 @@ const (
 	SensitivityRestricted
 )
 
+// String 返回分级的稳定名称，便于日志与判定依据可读。
+func (s Sensitivity) String() string {
+	switch s {
+	case SensitivityPublic:
+		return "public"
+	case SensitivityInternal:
+		return "internal"
+	case SensitivityConfidential:
+		return "confidential"
+	case SensitivityRestricted:
+		return "restricted"
+	default:
+		return "unknown"
+	}
+}
+
 // Decision 访问判定结论。
 type Decision int
 
@@ -37,6 +53,8 @@ const (
 	ReasonResourceNotFound       Reason = "RESOURCE_NOT_FOUND"       // 资源不存在
 	ReasonMaskConfigInvalid      Reason = "MASK_CONFIG_INVALID"      // 脱敏配置非法或缺失
 	ReasonRuleDenied             Reason = "RULE_DENIED"              // 命中策略规则显式拒绝
+	ReasonGrantSensitivityCap    Reason = "GRANT_SENSITIVITY_EXCEEDED" // 数据分级超过授权覆盖上限
+	ReasonSensitivityOutOfScope  Reason = "SENSITIVITY_OUT_OF_SCOPE"   // 分级无任何策略规则覆盖
 	ReasonInternalError          Reason = "INTERNAL_ERROR"           // 内部错误（细节不透出）
 )
 
@@ -49,6 +67,9 @@ type Grant struct {
 	ExpiresAt time.Time
 	Revoked   bool
 	UpdatedAt time.Time // 撤销/最近变更时间，用于判定依据
+	// MaxSensitivity 声明本授权最多覆盖到的数据分级（含该级别）。
+	// 为 nil 时表示不设上限，保持存量授权行为。
+	MaxSensitivity *Sensitivity
 }
 
 // Subject 主体属性（判定输入快照）。
@@ -86,12 +107,21 @@ const (
 )
 
 // Rule 策略规则：资源 + 目的匹配后的效果与字段规则。
+//
+// 数据分级适用性（兼容存量策略）：
+//   - MinSensitivity 与 MaxSensitivity 同时为 nil 时，规则不按分级筛选，
+//     语义与扩展前完全一致；
+//   - 否则规则只在数据分级落入 [MinSensitivity, MaxSensitivity] 闭区间时适用：
+//     任一边界为 nil 表示该侧不设限。数据分级不在任何规则覆盖范围内时，
+//     判定为 SENSITIVITY_OUT_OF_SCOPE 拒绝，不会落到其他允许规则上放行。
 type Rule struct {
-	Resources    []string
-	Purposes     []string
-	MinClearance int
-	Effect       RuleEffect
-	FieldRules   []FieldRule
+	Resources      []string
+	Purposes       []string
+	MinClearance   int
+	Effect         RuleEffect
+	FieldRules     []FieldRule
+	MinSensitivity *Sensitivity
+	MaxSensitivity *Sensitivity
 }
 
 // Policy 一个不可变的策略版本。

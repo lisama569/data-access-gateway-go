@@ -57,6 +57,21 @@ func (d *DataSet) GetRecord(resource string) (model.Record, bool) {
 	return r, true
 }
 
+// Reclassify 原子调整一条记录的数据分级，对之后的请求立即生效。
+// 更新在同一把写锁内完成，并发访问要么读到旧分级、要么读到新分级，
+// 单次判定不会读到半新半旧的分级状态。记录不存在时返回 false。
+func (d *DataSet) Reclassify(resource string, level model.Sensitivity, at time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	r, ok := d.records[resource]
+	if !ok {
+		return false
+	}
+	r.Sensitivity = level
+	d.records[resource] = r
+	return true
+}
+
 // PutGrant 写入授权（字段做防御性拷贝）。
 func (d *DataSet) PutGrant(g model.Grant) {
 	d.mu.Lock()
@@ -68,6 +83,10 @@ func (d *DataSet) PutGrant(g model.Grant) {
 		purposes := make([]string, len(g.Purposes))
 		copy(purposes, g.Purposes)
 		g.Purposes = purposes
+	}
+	if g.MaxSensitivity != nil {
+		cap := *g.MaxSensitivity
+		g.MaxSensitivity = &cap
 	}
 	d.grants[g.ID] = g
 }

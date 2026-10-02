@@ -32,10 +32,11 @@ type Entry struct {
 	Basis         model.DecisionBasis
 	MaskedFields  []string // 仅字段名
 	// 复现所需快照。
-	Policy          model.Policy
-	Subject         SubjectSnapshot
-	RecordExpiresAt time.Time // 数据保留期快照
-	DataExisted     bool      // 请求时记录是否存在
+	Policy            model.Policy
+	Subject           SubjectSnapshot
+	RecordExpiresAt   time.Time            // 数据保留期快照
+	RecordSensitivity model.Sensitivity    // 数据分级快照（重新分级后历史仍按当时分级复现）
+	DataExisted       bool                 // 请求时记录是否存在
 }
 
 // Log 并发安全的内存审计日志。
@@ -75,12 +76,26 @@ func cloneEntry(e Entry) Entry {
 			copy(p, g.Purposes)
 			g.Purposes = p
 		}
+		if g.MaxSensitivity != nil {
+			cap := *g.MaxSensitivity
+			g.MaxSensitivity = &cap
+		}
 		e.Subject.Grant = &g
 	}
 	pol := e.Policy
 	if len(pol.Rules) > 0 {
 		rules := make([]model.Rule, len(pol.Rules))
 		copy(rules, pol.Rules)
+		for i := range rules {
+			if rules[i].MinSensitivity != nil {
+				lo := *rules[i].MinSensitivity
+				rules[i].MinSensitivity = &lo
+			}
+			if rules[i].MaxSensitivity != nil {
+				hi := *rules[i].MaxSensitivity
+				rules[i].MaxSensitivity = &hi
+			}
+		}
 		pol.Rules = rules
 	}
 	e.Policy = pol

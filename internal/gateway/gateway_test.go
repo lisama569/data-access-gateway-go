@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -61,6 +62,67 @@ func researchReq() model.AccessRequest {
 		Resource: "res:patient-1",
 		Purpose:  "research",
 	}
+}
+
+func sensPtr(s model.Sensitivity) *model.Sensitivity { return &s }
+
+// sensitivityPolicyV1 分级分段策略：public/internal 允许明文，
+// confidential 需脱敏，restricted 显式拒绝。
+func sensitivityPolicyV1() model.Policy {
+	return model.Policy{
+		Version:     "v-sens",
+		EffectiveAt: baseTime.AddDate(-1, 0, 0),
+		Description: "按数据分级分段：低敏明文 / 机密脱敏 / 受限拒绝",
+		Rules: []model.Rule{
+			{
+				Resources: []string{"res:patient-1"}, Purposes: []string{"research"},
+				MinSensitivity: sensPtr(model.SensitivityPublic),
+				MaxSensitivity: sensPtr(model.SensitivityInternal),
+				Effect:         model.EffectAllow,
+			},
+			{
+				Resources: []string{"res:patient-1"}, Purposes: []string{"research"},
+				MinSensitivity: sensPtr(model.SensitivityConfidential),
+				MaxSensitivity: sensPtr(model.SensitivityConfidential),
+				Effect:         model.EffectMask,
+				FieldRules:     []model.FieldRule{{Field: "name", Transform: "mask"}, {Field: "ssn", Transform: "tokenize", TokenDomain: "hr"}},
+			},
+			{
+				Resources: []string{"res:patient-1"}, Purposes: []string{"research"},
+				MinSensitivity: sensPtr(model.SensitivityRestricted),
+				MaxSensitivity: sensPtr(model.SensitivityRestricted),
+				Effect:         model.EffectDeny,
+			},
+		},
+	}
+}
+
+func newSensitivityHarness(t *testing.T, startLevel model.Sensitivity) (*Gateway, *policy.Store, *dataset.DataSet, *masking.Service, *audit.Log) {
+	t.Helper()
+	clock := func() time.Time { return baseTime }
+	store := policy.NewStore()
+	if err := store.Publish(sensitivityPolicyV1()); err != nil {
+		t.Fatal(err)
+	}
+	data := dataset.New(clock)
+	data.PutRecord(model.Record{
+		ID: "patient-1", Resource: "res:patient-1", Sensitivity: startLevel,
+		ExpiresAt: baseTime.AddDate(1, 0, 0),
+		Fields:    map[string]string{"name": "Alice Chen", "ssn": "123-45-6789", "city": "Shanghai"},
+	})
+	data.PutGrant(model.Grant{
+		ID: "g-alice", SubjectID: "u-alice", Resource: "res:patient-1",
+		Purposes: []string{"research"}, ExpiresAt: baseTime.Add(24 * time.Hour),
+	})
+	svc := masking.NewService()
+	log := audit.NewLog()
+	return New(store, data, svc, log, clock), store, data, svc, log
+}
+
+func logSensitivity(t *testing.T, tag string, level model.Sensitivity, res model.AccessResult, entryID int64) {
+	t.Helper()
+	t.Logf("[%s] entry=%d input={subject=u-alice resource=res:patient-1 purpose=research level=%s policy=%s} decision=%d reason=%q factors=%v",
+		tag, entryID, level, res.PolicyVersion, res.Decision, res.Reason, res.Basis.Factors)
 }
 
 func logResult(t *testing.T, tag string, res model.AccessResult, entryID int64) {
@@ -376,4 +438,256 @@ func TestReplayAfterGrantRevoked(t *testing.T) {
 	if replayed.Decision != model.DecisionMask {
 		t.Fatalf("historical conclusion drifted: %d %q", replayed.Decision, replayed.Reason)
 	}
+}
+
+// 端到端：同一主体/数据/目的/策略版本，只调数据分级，结论随之变严。
+func TestEndToEndDecisionFollowsSensitivity(t *testing.T) {
+	gw, _, data, _, _ := newSensitivityHarness(t, model.SensitivityPublic)
+
+	low, _ := gw.Access(researchReq())
+	logSensitivity(t, "public", model.SensitivityPublic, low, 0)
+	if low.Decision != model.DecisionAllow || low.PolicyVersion != "v-sens" {
+		t.Fatalf("public level got %d %q", low.Decision, low.Reason)
+	}
+
+	// 升到 confidential：脱敏。
+	data.Reclassify("res:patient-1", model.SensitivityConfidential, baseTime)
+	mid, _ := gw.Access(researchReq())
+	logSensitivity(t, "confidential", model.SensitivityConfidential, mid, 0)
+	if mid.Decision != model.DecisionMask || mid.Record == nil || mid.Record.Fields["name"] != "***REDACTED***" {
+		t.Fatalf("confidential level got d=%d reason=%q", mid.Decision, mid.Reason)
+	}
+
+	// 升到最高 restricted：显式拒绝。调整对之后请求立即生效。
+	data.Reclassify("res:patient-1", model.SensitivityRestricted, baseTime)
+	high, _ := gw.Access(researchReq())
+	logSensitivity(t, "restricted", model.SensitivityRestricted, high, 0)
+	if high.Decision != model.DecisionDeny || high.Reason != model.ReasonRuleDenied {
+		t.Fatalf("restricted level got d=%d reason=%q, want deny RULE_DENIED", high.Decision, high.Reason)
+	}
+
+	// 验收红线：最低档与最高档结论不同。
+	if low.Decision == high.Decision && low.Reason == high.Reason {
+		t.Fatal("raising sensitivity alone must change the conclusion")
+	}
+}
+
+// 端到端：授权分级上限生效，且拒绝理由与缺授权/撤销/目的不匹配可区分。
+func TestEndToEndGrantSensitivityCapDistinct(t *testing.T) {
+	// 策略规则不按分级筛选（存量策略），由授权上限单独把关。
+	gw, _, data, _, _ := newHarness(t)
+	capLevel := model.SensitivityInternal
+	data.PutGrant(model.Grant{
+		ID: "g-capped", SubjectID: "u-capped", Resource: "res:patient-1",
+		Purposes: []string{"research"}, ExpiresAt: baseTime.Add(24 * time.Hour),
+		MaxSensitivity: &capLevel,
+	})
+	req := researchReq()
+	req.Subject.ID = "u-capped"
+
+	// 数据当前是 restricted（harness 默认），超过 internal 上限。
+	res, id := gw.Access(req)
+	logResult(t, "grant-cap-exceeded", res, id)
+	if res.Decision != model.DecisionDeny || res.Reason != model.ReasonGrantSensitivityCap {
+		t.Fatalf("got d=%d reason=%q, want GRANT_SENSITIVITY_EXCEEDED", res.Decision, res.Reason)
+	}
+	for _, other := range []model.Reason{
+		model.ReasonGrantMissing, model.ReasonGrantRevoked,
+		model.ReasonPurposeMismatch, model.ReasonRuleDenied,
+		model.ReasonSensitivityOutOfScope,
+	} {
+		if res.Reason == other {
+			t.Fatalf("cap reason must be distinct from %q", other)
+		}
+	}
+
+	// 降到上限以内：结论回到正常脱敏，证明是上限在把关而非其他原因。
+	rec, _ := data.GetRecord("res:patient-1")
+	rec.Sensitivity = model.SensitivityInternal
+	data.PutRecord(rec)
+	res2, id2 := gw.Access(req)
+	logResult(t, "grant-cap-within", res2, id2)
+	if res2.Decision != model.DecisionMask || res2.Reason != model.ReasonNone {
+		t.Fatalf("within cap got d=%d reason=%q, want mask", res2.Decision, res2.Reason)
+	}
+}
+
+// 端到端：重新分级后新请求按新分级判定，而历史审计仍按当时分级复现旧结论。
+func TestReclassifyThenReplayUsesHistoricalSnapshot(t *testing.T) {
+	gw, _, data, _, _ := newSensitivityHarness(t, model.SensitivityConfidential)
+
+	// 调整前：confidential -> mask，留下审计。
+	before, beforeID := gw.Access(researchReq())
+	logSensitivity(t, "before-reclassify", model.SensitivityConfidential, before, beforeID)
+	if before.Decision != model.DecisionMask {
+		t.Fatalf("setup: got d=%d reason=%q", before.Decision, before.Reason)
+	}
+
+	// 升到最高：新请求立即按 restricted 判定为拒绝。
+	if !data.Reclassify("res:patient-1", model.SensitivityRestricted, baseTime) {
+		t.Fatal("reclassify failed")
+	}
+	after, afterID := gw.Access(researchReq())
+	logSensitivity(t, "after-reclassify", model.SensitivityRestricted, after, afterID)
+	if after.Decision != model.DecisionDeny || after.Reason != model.ReasonRuleDenied {
+		t.Fatalf("new request must follow new level: d=%d reason=%q", after.Decision, after.Reason)
+	}
+
+	// 历史审计仍按当时 confidential 快照复现出 mask，结论不漂移。
+	replayed, err := gw.Replay(beforeID)
+	if err != nil {
+		t.Fatalf("replay historical: %v", err)
+	}
+	t.Logf("[replay-old] entry=%d level-snapshot=confidential decision=%d reason=%q policy=%s factors=%v",
+		beforeID, replayed.Decision, replayed.Reason, replayed.PolicyVersion, replayed.Basis.Factors)
+	if replayed.Decision != model.DecisionMask || replayed.Reason != model.ReasonNone {
+		t.Fatalf("historical replay drifted to d=%d reason=%q", replayed.Decision, replayed.Reason)
+	}
+	if replayed.Record != nil {
+		t.Fatal("replay must not return record data")
+	}
+
+	// 新审计按 restricted 复现为拒绝。
+	replayed2, err := gw.Replay(afterID)
+	if err != nil {
+		t.Fatalf("replay new: %v", err)
+	}
+	if replayed2.Decision != model.DecisionDeny || replayed2.Reason != model.ReasonRuleDenied {
+		t.Fatalf("new replay drifted: d=%d reason=%q", replayed2.Decision, replayed2.Reason)
+	}
+
+	// 审计条目必须各自携带不同的分级快照。
+	e1, _ := gw.log.Get(beforeID)
+	e2, _ := gw.log.Get(afterID)
+	if e1.RecordSensitivity != model.SensitivityConfidential || e2.RecordSensitivity != model.SensitivityRestricted {
+		t.Fatalf("audit sensitivity snapshots wrong: %s vs %s", e1.RecordSensitivity, e2.RecordSensitivity)
+	}
+}
+
+// 端到端：分级超出策略规则覆盖范围时拒绝，不会被其它允许规则放行。
+func TestEndToEndSensitivityOutOfScopeDenied(t *testing.T) {
+	clock := func() time.Time { return baseTime }
+	store := policy.NewStore()
+	p := sensitivityPolicyV1()
+	// 删除最高档 deny 规则，使 restricted 不被任何规则覆盖。
+	p.Rules = p.Rules[:2]
+	if err := store.Publish(p); err != nil {
+		t.Fatal(err)
+	}
+	data := dataset.New(clock)
+	data.PutRecord(model.Record{
+		ID: "patient-1", Resource: "res:patient-1", Sensitivity: model.SensitivityRestricted,
+		Fields: map[string]string{"name": "Alice Chen"},
+	})
+	data.PutGrant(model.Grant{
+		ID: "g-alice", SubjectID: "u-alice", Resource: "res:patient-1",
+		Purposes: []string{"research"}, ExpiresAt: baseTime.Add(24 * time.Hour),
+	})
+	gw := New(store, data, masking.NewService(), audit.NewLog(), clock)
+
+	res, id := gw.Access(researchReq())
+	logSensitivity(t, "out-of-scope", model.SensitivityRestricted, res, id)
+	if res.Decision != model.DecisionDeny || res.Reason != model.ReasonSensitivityOutOfScope {
+		t.Fatalf("got d=%d reason=%q, want SENSITIVITY_OUT_OF_SCOPE", res.Decision, res.Reason)
+	}
+	if res.Record != nil {
+		t.Fatal("out-of-scope deny must not return record")
+	}
+}
+
+// 并发混合：持续重分级与持续访问交错。要求：
+//   - 带 -race 多轮稳定通过（单次判定不会读到撕裂/半新半旧的分级状态）；
+//   - 每次结论只能是当前分级分段策略允许的合法组合；
+//   - 每条审计事后都能按其分级快照复现出与当时完全一致的结论。
+func TestConcurrentReclassifyMixedAccess(t *testing.T) {
+	gw, _, data, _, _ := newSensitivityHarness(t, model.SensitivityConfidential)
+	const writers, readers, perReader = 4, 8, 60
+	levels := []model.Sensitivity{
+		model.SensitivityPublic, model.SensitivityInternal,
+		model.SensitivityConfidential, model.SensitivityRestricted,
+	}
+	var (
+		writerWg, readerWg sync.WaitGroup
+		mu                sync.Mutex
+		allIDs            []int64
+		seen              = map[model.Decision]int{}
+	)
+	stop := make(chan struct{})
+
+	for w := 0; w < writers; w++ {
+		w := w
+		writerWg.Add(1)
+		go func() {
+			defer writerWg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					data.Reclassify("res:patient-1", levels[(i+w)%len(levels)], baseTime)
+					runtime.Gosched() // 给读者与其它写者让路，制造真实交错
+				}
+			}
+		}()
+	}
+	for r := 0; r < readers; r++ {
+		readerWg.Add(1)
+		go func() {
+			defer readerWg.Done()
+			ids := make([]int64, 0, perReader)
+			for i := 0; i < perReader; i++ {
+				res, id := gw.Access(researchReq())
+				// 分级分段策略下只可能出现这三种合法结论。
+				switch res.Decision {
+				case model.DecisionAllow:
+					if res.Reason != model.ReasonNone {
+						t.Errorf("allow with reason %q", res.Reason)
+					}
+				case model.DecisionMask:
+					if res.Reason != model.ReasonNone || res.Record == nil || res.Record.Fields["name"] != "***REDACTED***" {
+						t.Errorf("inconsistent mask: reason=%q", res.Reason)
+					}
+				case model.DecisionDeny:
+					if res.Reason != model.ReasonRuleDenied {
+						t.Errorf("unexpected deny reason %q", res.Reason)
+					}
+				}
+				ids = append(ids, id)
+				mu.Lock()
+				seen[res.Decision]++
+				mu.Unlock()
+			}
+			mu.Lock()
+			allIDs = append(allIDs, ids...)
+			mu.Unlock()
+		}()
+	}
+	readerWg.Wait()
+	close(stop)
+	writerWg.Wait()
+
+	// 全部审计按各自分级快照复现，结论必须与当时一致（不随并发重分级漂移）。
+	mu.Lock()
+	ids := append([]int64(nil), allIDs...)
+	mu.Unlock()
+	if len(ids) != readers*perReader {
+		t.Fatalf("collected %d audits, want %d", len(ids), readers*perReader)
+	}
+	for _, id := range ids {
+		e, ok := gw.log.Get(id)
+		if !ok {
+			t.Fatalf("audit %d missing", id)
+		}
+		replayed, err := gw.Replay(id)
+		if err != nil {
+			t.Fatalf("replay %d: %v", id, err)
+		}
+		if replayed.Decision != e.Decision || replayed.Reason != e.Reason || replayed.PolicyVersion != e.PolicyVersion {
+			t.Fatalf("audit %d drifted: orig=(%d %q %s) replay=(%d %q %s)",
+				id, e.Decision, e.Reason, e.PolicyVersion,
+				replayed.Decision, replayed.Reason, replayed.PolicyVersion)
+		}
+	}
+	t.Logf("[concurrent-reclassify] accesses=%d decisions seen=%v, every audit replayed consistently",
+		len(ids), seen)
 }
