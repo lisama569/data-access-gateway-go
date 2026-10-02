@@ -90,4 +90,25 @@ func main() {
 	}
 	fmt.Printf("replay entry %d: decision=%v reason=%q policy=%s\n",
 		entryID, replayed.Decision, replayed.Reason, replayed.PolicyVersion)
+
+	// 授权分级上限：新授权最多覆盖到 internal，而数据分级为 restricted。
+	capInternal := model.SensitivityInternal
+	data.PutGrant(model.Grant{
+		ID: "g2", SubjectID: "u-alice", Resource: "patient:1001",
+		Purposes: []string{"research"}, ExpiresAt: now.Add(24 * time.Hour),
+		MaxSensitivity: &capInternal, UpdatedAt: now.Add(time.Minute),
+	})
+	res4, _ := gw.Access(model.AccessRequest{Subject: subject, Resource: "patient:1001", Purpose: "research"})
+	fmt.Printf("capped grant vs restricted data: decision=%v reason=%q factors=%v\n",
+		res4.Decision, res4.Reason, res4.Basis.Factors)
+
+	// 分级调整对之后的请求立即生效；历史审计仍按当时分级快照复现。
+	data.Reclassify("patient:1001", model.SensitivityInternal)
+	res5, entry5 := gw.Access(model.AccessRequest{Subject: subject, Resource: "patient:1001", Purpose: "research"})
+	fmt.Printf("after reclassify to internal: decision=%v reason=%q policy=%s\n",
+		res5.Decision, res5.Reason, res5.PolicyVersion)
+	if _, err := gw.Replay(entry5); err != nil {
+		panic(err)
+	}
+	fmt.Printf("replay entry %d consistent after reclassification\n", entry5)
 }

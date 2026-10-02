@@ -41,6 +41,21 @@ func (d *DataSet) PutRecord(r model.Record) {
 	d.records[r.Resource] = r
 }
 
+// Reclassify 原子调整记录的敏感级别，对之后的读取立即生效。
+// 调整在写锁内整体完成，并发读取（GetRecord）要么看到旧分级、要么看到
+// 新分级，不会读到中间状态。记录不存在时返回 false。
+func (d *DataSet) Reclassify(resource string, s model.Sensitivity) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	r, ok := d.records[resource]
+	if !ok {
+		return false
+	}
+	r.Sensitivity = s
+	d.records[resource] = r
+	return true
+}
+
 // GetRecord 按资源标识读取记录，返回深拷贝避免调用方修改共享状态。
 func (d *DataSet) GetRecord(resource string) (model.Record, bool) {
 	d.mu.RLock()

@@ -91,24 +91,27 @@ func (g *Gateway) Access(req model.AccessRequest) (result model.AccessResult, en
 		}
 		subjectSnap.Grant = req.Grant
 		expires := time.Time{}
+		var sensitivity model.Sensitivity
 		if ok {
 			expires = rec.ExpiresAt
+			sensitivity = rec.Sensitivity
 		}
 		id, err := g.log.Append(audit.Entry{
-			Time:            at,
-			SubjectID:       req.Subject.ID,
-			Resource:        req.Resource,
-			Purpose:         req.Purpose,
-			PinnedVersion:   req.PinnedVersion,
-			Decision:        result.Decision,
-			Reason:          result.Reason,
-			PolicyVersion:   result.PolicyVersion,
-			Basis:           result.Basis,
-			MaskedFields:    result.MaskedFields,
-			DataExisted:     ok,
-			RecordExpiresAt: expires,
-			Policy:          policySnap,
-			Subject:         subjectSnap,
+			Time:              at,
+			SubjectID:         req.Subject.ID,
+			Resource:          req.Resource,
+			Purpose:           req.Purpose,
+			PinnedVersion:     req.PinnedVersion,
+			Decision:          result.Decision,
+			Reason:            result.Reason,
+			PolicyVersion:     result.PolicyVersion,
+			Basis:             result.Basis,
+			MaskedFields:      result.MaskedFields,
+			DataExisted:       ok,
+			RecordExpiresAt:   expires,
+			RecordSensitivity: sensitivity,
+			Policy:            policySnap,
+			Subject:           subjectSnap,
 		})
 		if err != nil {
 			// 审计失败不应把底层错误泄露给调用方。
@@ -199,8 +202,12 @@ func (g *Gateway) Replay(entryID int64) (model.AccessResult, error) {
 
 	var recPtr *model.Record
 	if e.DataExisted {
-		// 只有保留期参与判定，字段内容不需要、也不应进入复现路径。
-		rec := model.Record{Resource: e.Resource, ExpiresAt: e.RecordExpiresAt}
+		// 只有保留期与分级快照参与判定，字段内容不需要、也不应进入复现路径。
+		rec := model.Record{
+			Resource:    e.Resource,
+			ExpiresAt:   e.RecordExpiresAt,
+			Sensitivity: e.RecordSensitivity,
+		}
 		recPtr = &rec
 	}
 

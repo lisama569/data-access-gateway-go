@@ -1,7 +1,10 @@
 // Package model 定义数据访问网关使用的核心领域类型。
 package model
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 // Sensitivity 资源敏感级别。
 type Sensitivity int
@@ -12,6 +15,33 @@ const (
 	SensitivityConfidential
 	SensitivityRestricted
 )
+
+// String 返回敏感级别的稳定名称，便于日志与判定依据展示。
+func (s Sensitivity) String() string {
+	switch s {
+	case SensitivityPublic:
+		return "public"
+	case SensitivityInternal:
+		return "internal"
+	case SensitivityConfidential:
+		return "confidential"
+	case SensitivityRestricted:
+		return "restricted"
+	default:
+		return "unknown(" + strconv.Itoa(int(s)) + ")"
+	}
+}
+
+// SensitivityRange 闭区间敏感级别范围 [Min, Max]。
+type SensitivityRange struct {
+	Min Sensitivity
+	Max Sensitivity
+}
+
+// Contains 判断级别是否落在范围内。
+func (r SensitivityRange) Contains(s Sensitivity) bool {
+	return s >= r.Min && s <= r.Max
+}
 
 // Decision 访问判定结论。
 type Decision int
@@ -37,6 +67,8 @@ const (
 	ReasonResourceNotFound       Reason = "RESOURCE_NOT_FOUND"       // 资源不存在
 	ReasonMaskConfigInvalid      Reason = "MASK_CONFIG_INVALID"      // 脱敏配置非法或缺失
 	ReasonRuleDenied             Reason = "RULE_DENIED"              // 命中策略规则显式拒绝
+	ReasonSensitivityNotCovered  Reason = "SENSITIVITY_NOT_COVERED"  // 数据分级落在规则声明的适用范围之外
+	ReasonGrantSensitivityCap    Reason = "GRANT_SENSITIVITY_CAP"    // 数据分级超出授权声明的覆盖上限
 	ReasonInternalError          Reason = "INTERNAL_ERROR"           // 内部错误（细节不透出）
 )
 
@@ -48,7 +80,10 @@ type Grant struct {
 	Purposes  []string
 	ExpiresAt time.Time
 	Revoked   bool
-	UpdatedAt time.Time // 撤销/最近变更时间，用于判定依据
+	// MaxSensitivity 授权最多覆盖到的敏感级别（含）。nil 表示不声明上限，
+	// 保持扩展前的行为；数据分级超过该上限时以 GRANT_SENSITIVITY_CAP 拒绝。
+	MaxSensitivity *Sensitivity
+	UpdatedAt      time.Time // 撤销/最近变更时间，用于判定依据
 }
 
 // Subject 主体属性（判定输入快照）。
@@ -90,8 +125,11 @@ type Rule struct {
 	Resources    []string
 	Purposes     []string
 	MinClearance int
-	Effect       RuleEffect
-	FieldRules   []FieldRule
+	// Sensitivity 规则适用的敏感级别范围（闭区间）。nil 表示不声明，
+	// 适用全部级别，语义与扩展前一致。
+	Sensitivity *SensitivityRange
+	Effect      RuleEffect
+	FieldRules  []FieldRule
 }
 
 // Policy 一个不可变的策略版本。
