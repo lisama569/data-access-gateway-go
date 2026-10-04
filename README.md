@@ -51,15 +51,26 @@ cmd/demo           本地可运行演示
 - 规则按数组顺序匹配，取第一条「资源 + 数据分级 + 目的」均命中的规则；
   空列表或 `"*"` 表示通配。
 - 规则效果为 `deny / mask / allow`，`mask` 必须携带字段规则（见下）。
-- **规则的分级适用范围**（新增，`Rule.MinSensitivity / MaxSensitivity`）：
-  - 两者均为 `nil` 时，规则**不按分级筛选**，对任意分级都适用——这是存量
-    策略的行为，本次扩展不改变；
+- **规则的分级适用范围**（`Rule.MinSensitivity / MaxSensitivity`）：
+  - 两者均为 `nil` 时，规则**自身不按分级筛选**；
   - 否则规则只在数据分级落入闭区间 `[MinSensitivity, MaxSensitivity]` 时适用，
     任一边界为 `nil` 表示该侧不设限（如只设 `MinSensitivity` 表示该级及以上）；
-  - 数据分级**不在任何一条规则覆盖范围内**时，返回
-    `SENSITIVITY_OUT_OF_SCOPE` 拒绝：分级超范围的规则会被跳过并继续向后匹配，
-    因此**不会误落到后面的通配允许规则上把高敏数据放行**；
-  - 仅当策略里没有任何规则针对该资源时，才返回 `NO_APPLICABLE_POLICY`。
+    **边界是闭区间**：分级正好压在上/下边界上时仍按该规则正常判定。
+  - **写明范围与未声明范围规则共存时的判定（本轮修复的漏放路径）**：
+    - 同一资源、同一访问目的下只要存在至少一条写明了分级范围的规则，这些
+      写明范围的**并集**就是该资源/目的组合的完整分级覆盖面；
+    - 分级落在并集之内时，仍按数组顺序取第一条匹配规则，未声明范围的规则
+      在此情形下仍是合法的兜底候选；
+    - 分级**落在所有写明范围之外**（调高到超出所有上界，或调低到低于所有
+      下界）时，**未声明范围的规则也一律不得生效**，无论其效果是
+      `allow / mask / deny`，统一返回 `SENSITIVITY_OUT_OF_SCOPE` 拒绝，
+      且**不返回任何数据内容**——不会再出现「分级一路调高反而落到无范围
+      规则上照常放行、分级越高结论越松」；
+    - 范围只针对**别的目的**时不算本目的的覆盖面（按「资源 + 目的」组合
+      分别计算），因此不会误关存量目的的访问；
+    - 该资源/目的下**没有任何规则写明范围**（纯存量策略）时，不开启此闸门，
+      匹配与结论与扩展前完全一致；
+    - 仅当策略里没有任何规则针对该资源时，才返回 `NO_APPLICABLE_POLICY`。
 - 版本选择：
   - 默认取请求时刻**已生效且未退役**的最新发布版本；
   - 可通过 `PinnedVersion` 显式固定版本；该版本若尚未生效或已退役，
@@ -78,9 +89,12 @@ cmd/demo           本地可运行演示
    存量授权无此步）
 6. 授权目的不覆盖访问目的 → `PURPOSE_MISMATCH`
 7. 主体密级低于规则要求 → `CLEARANCE_INSUFFICIENT`
-8. **规则分级适用范围**：分级不在规则声明区间内的规则被跳过；有规则针对该资源、
-   但分级不落入任何覆盖区间 → `SENSITIVITY_OUT_OF_SCOPE`（规则未声明区间则
-   不按分级筛选，兼容存量策略）
+8. **规则分级适用范围**：分级不在规则声明闭区间内的规则被跳过；同一资源+
+   同一目的下存在写明范围的规则、而当前分级不落入任何写明范围时，未声明
+   范围的兜底规则（无论 allow/mask/deny）也统一判
+   `SENSITIVITY_OUT_OF_SCOPE` 且不返回数据；没有任何规则写明范围则不按
+   分级筛选，兼容存量策略。目的不符（第 6 步已先判授权目的，规则侧目的
+   不匹配）等更具体的既有拒绝理由不会被该理由顶掉。
 9. 规则效果：`deny → RULE_DENIED`；`mask → 需脱敏`；`allow → 允许`
 10. 无规则匹配该资源/无有效版本 → `NO_APPLICABLE_POLICY`
 
@@ -136,12 +150,15 @@ cmd/demo           本地可运行演示
 本次「数据分级进入判定」为纯增量扩展，默认行为不变：
 
 - **存量策略**：规则不设置 `MinSensitivity / MaxSensitivity` 时不按分级筛选，
-  匹配与结论与扩展前完全一致（由 `TestRuleWithoutSensitivityMatchesAllLevels`
-  锁定）。
+  匹配与结论与扩展前完全一致（由 `TestRuleWithoutSensitivityMatchesAllLevels`、
+  `TestAllUnscopedRulesLegacyUnaffected` 锁定）。更精确地说，只要某资源/目的
+  组合下**没有任何一条**规则写明范围，该组合就完全走存量语义。
 - **存量授权**：`Grant.MaxSensitivity == nil` 时不做分级上限检查，任何数据分级下
   结论都不因本扩展改变（由 `TestLegacyGrantWithoutCapUnaffected` 锁定）。
 - 只有显式声明了分级区间的规则、或显式声明了上限的授权，才会启用新判定路径；
-  新原因码只在这些路径上产生。
+  新原因码只在这些路径上产生。授权缺失/已撤销、目的不符、密级不足、保留期等
+  既有明确拒绝的优先级不变，不会被 `SENSITIVITY_OUT_OF_SCOPE` 顶掉
+  （由 `TestOutOfScopeDoesNotOverridePurposeMismatch` 锁定）。
 
 ## 并发安全
 
@@ -166,10 +183,13 @@ go run ./cmd/demo
 # 3. 全量测试（带数据竞争检测，建议多轮）
 go test -race -count=3 ./...
 
-# 4. 只跑分级相关用例并查看输入属性/命中策略/判定依据日志
-go test -race -v -run 'Sensitivity|Reclassify' ./internal/pdp/ ./internal/dataset/ ./internal/gateway/
+# 4. 只跑分级相关用例并查看输入属性/命中规则/判定依据日志
+go test -race -v -run 'Sensitivity|Unscoped|Scope|Reclassify' ./internal/pdp/ ./internal/dataset/ ./internal/gateway/
 
-# 5. 查看全部带输入属性/命中策略/判定依据的测试日志
+# 5. 复现本轮漏放路径修复（写明范围 + 未声明范围兜底共存，调高分级必须越界拒绝）
+go test -race -v -count=3 -run 'TestSensitivityRaiseBlocksUnscopedFallback|TestEndToEndUnscopedFallbackDoesNotBypassScope|TestConcurrentReclassifyMixedScopeGate' ./internal/pdp/ ./internal/gateway/
+
+# 6. 查看全部带输入属性/命中策略/判定依据的测试日志
 go test -race -v ./internal/pdp/ ./internal/gateway/
 ```
 
@@ -181,15 +201,20 @@ go test -race -v ./internal/pdp/ ./internal/gateway/
   （demo 中授权上限为 confidential，因此是 `GRANT_SENSITIVITY_EXCEEDED`；
   去掉授权上限则命中策略最高档 `RULE_DENIED`）；
 - 历史审计仍按当时 `confidential` 分级快照复现出 mask 结论；
-- 分级降回 `confidential` 后结论恢复脱敏——证明是分级在主导结论。
+- 分级降回 `confidential` 后结论恢复脱敏——证明是分级在主导结论；
+- **漏放路径**（patient:2002，策略含写明 `public..internal` 范围的脱敏规则与一条
+  未声明范围的兜底允许、授权不设上限）：分级在上边界 `internal` 时按写明规则
+  脱敏；只调高到 `confidential`（超出所有写明范围）立即变为
+  `SENSITIVITY_OUT_OF_SCOPE` 拒绝、`record returned: false`，不会落到兜底
+  allow 上放行。
 
 ### 测试覆盖
 
 | 测试 | 覆盖点 |
 | --- | --- |
 | `policy` | 版本发布去重、生效/退役窗口、归档可读 |
-| `pdp` | 全部稳定原因码、固定退役版本拒绝、规则显式拒绝、同输入确定性、**同一输入只改分级结论变严、分级超范围不误命中允许规则、规则不声明分级时兼容、授权分级上限生效且原因码可区分、存量授权无上限时结论不变** |
+| `pdp` | 全部稳定原因码、固定退役版本拒绝、规则显式拒绝、同输入确定性、**同一输入只改分级结论变严、分级超范围不误命中允许规则、规则不声明分级时兼容、授权分级上限生效且原因码可区分、存量授权无上限时结论不变、写明范围与未声明范围共存时调高分级一律越界拒绝（闭区间边界仍按写明规则判）、单侧范围边界、越界不顶掉目的不符、写明范围只针对别的目的时不影响存量目的、越界时兜底 allow/mask/deny 统一拒绝** |
 | `masking` | 遮蔽不可逆、同域令牌稳定可逆、跨域隔离、非法配置拒绝 |
 | `dataset` | 深拷贝隔离、撤销立即生效、并发读写、**重分级立即生效且原子、分级上限指针防御性拷贝、并发重分级/读取无撕裂** |
 | `audit` | 快照防篡改、单调 ID、并发追加、无原文（含分级快照与新指针字段深拷贝） |
-| `gateway` | 端到端脱敏、审计无原文、原因可区分、版本切换、撤销即时生效、数据/策略保留期区分、历史复现、80 路混合并发与 100 路同输入并发（`-race`）、**端到端结论随分级变化、授权上限拒绝可区分、重分级后新请求按新级判定而历史审计复现旧级、分级超范围拒绝、480 次重分级/访问混合并发且每条审计可一致复现（`-race`）** |
+| `gateway` | 端到端脱敏、审计无原文、原因可区分、版本切换、撤销即时生效、数据/策略保留期区分、历史复现、80 路混合并发与 100 路同输入并发（`-race`）、**端到端结论随分级变化、授权上限拒绝可区分、重分级后新请求按新级判定而历史审计复现旧级、分级超范围拒绝、480 次重分级/访问混合并发且每条审计可一致复现（`-race`）、写明范围+未声明兜底共存时调高分级越界拒绝不返回数据且审计可复现、混合策略 480 次重分级/访问并发下越界档只出现越界拒绝（`-race`）** |

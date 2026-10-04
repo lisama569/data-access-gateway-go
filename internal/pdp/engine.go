@@ -11,8 +11,10 @@
 //  5. 目的匹配：授权目的与策略规则目的均须匹配，否则 PURPOSE_MISMATCH。
 //  6. 密级：低于规则要求 CLEARANCE_INSUFFICIENT。
 //  7. 规则分级范围：规则可声明 [MinSensitivity, MaxSensitivity] 适用区间，
-//     数据分级不在区间内的规则被跳过；无任何规则覆盖该分级时
-//     SENSITIVITY_OUT_OF_SCOPE；规则未声明区间则不按分级筛选（存量策略语义不变）。
+//     数据分级不在区间内的规则被跳过；同一资源+同一目的下只要存在写明区间的
+//     规则、而当前分级不落入任何写明区间，未声明区间的兜底规则（无论其效果是
+//     allow/mask/deny）也一律不得生效，统一判 SENSITIVITY_OUT_OF_SCOPE、
+//     不返回数据；没有任何规则写明区间时不按分级筛选（存量策略语义不变）。
 //  8. 规则效果：按规则顺序取第一条匹配规则的 deny/mask/allow。
 package pdp
 
@@ -75,6 +77,30 @@ func sensitivityInScope(level model.Sensitivity, min, max *model.Sensitivity) bo
 		return false
 	}
 	return true
+}
+
+// sensitivityCoverage 预扫描策略中针对「同一资源 + 同一访问目的」的分级覆盖情况：
+//   - scoped：至少存在一条写明了分级范围（min/max 任一非 nil）的相关规则；
+//   - covered：当前数据分级落在至少一条写明范围的闭区间内（含边界）。
+//
+// 仅统计资源与访问目的都匹配的规则，与主匹配循环的目的语义保持一致：
+// 当 scoped 为 true 而 covered 为 false 时，表示该资源/目的组合下有明确的
+// 分级分段，但当前分级落在所有写明范围之外——此时未声明范围的存量兜底规则
+// 不得再放行（防止「分级越高结论越松」的漏放路径）。
+func sensitivityCoverage(rules []model.Rule, resource, purpose string, level model.Sensitivity) (scoped, covered bool) {
+	for _, rule := range rules {
+		if !matchAny(rule.Resources, resource) || !matchAny(rule.Purposes, purpose) {
+			continue
+		}
+		if rule.MinSensitivity == nil && rule.MaxSensitivity == nil {
+			continue
+		}
+		scoped = true
+		if sensitivityInScope(level, rule.MinSensitivity, rule.MaxSensitivity) {
+			covered = true
+		}
+	}
+	return scoped, covered
 }
 
 // sensitivityRangeText 生成规则分级区间的可读文本，用于判定依据日志。
@@ -183,16 +209,30 @@ func (e *Engine) Verdict(req model.AccessRequest, rec *model.Record) (model.Deci
 	}
 
 	// 规则匹配：按顺序取第一条「资源 + 分级 + 目的」均匹配的规则。
-	// 分级不在规则声明区间内时跳过该规则继续向后找；这样分级超出某条规则
-	// 覆盖范围时不会误命中它后面的允许规则——后者若也不覆盖该分级同样会被跳过，
-	// 最终落到 SENSITIVITY_OUT_OF_SCOPE 拒绝。
+	// 分级不在某条规则声明区间内时跳过该规则继续向后找。
+	//
+	// 漏放闸门：同一资源+同一目的下只要存在写明分级范围的规则，而当前分级
+	// 不落入任何写明范围的闭区间，则未声明范围的存量兜底规则不得放行——
+	// 一律改判 SENSITIVITY_OUT_OF_SCOPE，避免「分级一路调高反而落到无范围
+	// 规则上照常放行」。写明了范围但超出区间的规则仍按顺序跳过。
+	// 存量策略（没有任何规则写明范围）不开启该闸门，结论与扩展前完全一致。
+	level := model.Sensitivity(0)
+	hasLevel := rec != nil
+	if hasLevel {
+		level = rec.Sensitivity
+	}
+	scopedForResource, levelCovered := false, false
+	if hasLevel {
+		scopedForResource, levelCovered = sensitivityCoverage(p.Rules, req.Resource, req.Purpose, level)
+	}
 	resourceMatched := false
 	for i, rule := range p.Rules {
 		if !matchAny(rule.Resources, req.Resource) {
 			continue
 		}
 		resourceMatched = true
-		if rec != nil && !sensitivityInScope(rec.Sensitivity, rule.MinSensitivity, rule.MaxSensitivity) {
+		ruleUnscoped := rule.MinSensitivity == nil && rule.MaxSensitivity == nil
+		if hasLevel && !ruleUnscoped && !sensitivityInScope(level, rule.MinSensitivity, rule.MaxSensitivity) {
 			basis.Factors = append(basis.Factors,
 				"rule:index="+itoa(i),
 				"rule:sensitivity_scope="+sensitivityRangeText(rule.MinSensitivity, rule.MaxSensitivity),
@@ -203,6 +243,14 @@ func (e *Engine) Verdict(req model.AccessRequest, rec *model.Record) (model.Deci
 		if !matchAny(rule.Purposes, req.Purpose) {
 			basis.Factors = append(basis.Factors, "rule:purpose_mismatch")
 			return deny(model.ReasonPurposeMismatch, p)
+		}
+		// 未声明范围的兜底规则：当前分级不被任何写明范围覆盖时一律拦在效果判定
+		// 之前——无论兜底规则自身是 allow/mask/deny，统一判
+		// SENSITIVITY_OUT_OF_SCOPE：都不返回数据，且拒绝理由稳定、可与其他拒绝
+		// （含 RULE_DENIED）区分。
+		if hasLevel && ruleUnscoped && scopedForResource && !levelCovered {
+			basis.Factors = append(basis.Factors, "rule:unscoped_fallback_blocked", "rule:sensitivity_out_of_scope")
+			return deny(model.ReasonSensitivityOutOfScope, p)
 		}
 		basis.RuleIndex = i
 		basis.MatchedRule = true

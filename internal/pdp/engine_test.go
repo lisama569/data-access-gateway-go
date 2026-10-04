@@ -343,3 +343,216 @@ func TestLegacyGrantWithoutCapUnaffected(t *testing.T) {
 		}
 	}
 }
+
+// mixedScopePolicy 复现漏放路径的策略：
+// 第一条规则写明只覆盖 public..internal（mask），
+// 第二条是没写分级范围的存量兜底 allow（陷阱）。
+// 修复前：confidential/restricted 跳过第一条后落到第二条被放行；
+// 修复后：超出所有写明范围一律 SENSITIVITY_OUT_OF_SCOPE。
+func mixedScopePolicy() model.Policy {
+	ptr := func(s model.Sensitivity) *model.Sensitivity { return &s }
+	return model.Policy{
+		Version:     "v-mixed",
+		EffectiveAt: t0.AddDate(-1, 0, 0),
+		Rules: []model.Rule{
+			{
+				Resources: []string{"res:1"}, Purposes: []string{"research"},
+				MinSensitivity: ptr(model.SensitivityPublic), MaxSensitivity: ptr(model.SensitivityInternal),
+				Effect:     model.EffectMask,
+				FieldRules: []model.FieldRule{{Field: "name", Transform: "mask"}},
+			},
+			{
+				Resources: []string{"res:1"}, Purposes: []string{"research"},
+				Effect: model.EffectAllow, // 未声明分级范围的兜底规则
+			},
+		},
+	}
+}
+
+// 同一主体/资源/目的/策略版本，只把分级从最低档一路调高：
+// 边界（public 下界、internal 上界）仍按写明范围的规则正常判定，
+// 一旦超出所有写明范围，结论变为可区分的 SENSITIVITY_OUT_OF_SCOPE 拒绝，
+// 绝不落到未声明范围的兜底 allow 上；结论只允许变严、不允许变松。
+func TestSensitivityRaiseBlocksUnscopedFallback(t *testing.T) {
+	store := fakeStore{pols: map[string]model.Policy{"v-mixed": mixedScopePolicy()}}
+	e := NewEngine(store, func() time.Time { return t0 })
+
+	cases := []struct {
+		level model.Sensitivity
+		wantD model.Decision
+		wantR model.Reason
+		bound string // 标注是否压在写明范围的边界上
+	}{
+		{model.SensitivityPublic, model.DecisionMask, model.ReasonNone, "lower-boundary"},
+		{model.SensitivityInternal, model.DecisionMask, model.ReasonNone, "upper-boundary"},
+		{model.SensitivityConfidential, model.DecisionDeny, model.ReasonSensitivityOutOfScope, "out-of-scope"},
+		{model.SensitivityRestricted, model.DecisionDeny, model.ReasonSensitivityOutOfScope, "out-of-scope"},
+	}
+	var prev model.Decision
+	for i, tc := range cases {
+		rec := &model.Record{Resource: "res:1", Sensitivity: tc.level}
+		req := baseReq(validGrant())
+		d, reason, pol, basis := e.Verdict(req, rec)
+		t.Logf("[%s level=%s] input={subject=u1 clearance=3 resource=res:1 purpose=research level=%s policy=%s} "+
+			"matched_rule=%d decision=%d reason=%q factors=%v",
+			tc.bound, tc.level, tc.level, pol.Version, basis.RuleIndex, d, reason, basis.Factors)
+		if d != tc.wantD || reason != tc.wantR {
+			t.Fatalf("level=%s: got d=%d reason=%q, want d=%d reason=%q",
+				tc.level, d, reason, tc.wantD, tc.wantR)
+		}
+		// 枚举序 Deny(0) < Mask(1) < Allow(2)：调高分级绝不能让结论变宽松。
+		if i > 0 && d > prev {
+			t.Fatalf("decision must not get more permissive as sensitivity rises: %d -> %d", prev, d)
+		}
+		prev = d
+	}
+
+	// 原因码必须与既有拒绝理由清楚区分。
+	hiRec := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityRestricted}
+	_, reason, _, basis := e.Verdict(baseReq(validGrant()), hiRec)
+	for _, other := range []model.Reason{
+		model.ReasonGrantMissing, model.ReasonGrantRevoked, model.ReasonPurposeMismatch,
+		model.ReasonClearanceInsufficient, model.ReasonRuleDenied, model.ReasonGrantSensitivityCap,
+	} {
+		if reason == other {
+			t.Fatalf("out-of-scope reason %q must be distinct from %q", reason, other)
+		}
+	}
+	if !containsFactor(basis.Factors, "rule:sensitivity_out_of_scope") {
+		t.Fatalf("basis must explain out-of-scope, factors=%v", basis.Factors)
+	}
+}
+
+func containsFactor(factors []string, want string) bool {
+	for _, f := range factors {
+		if f == want {
+			return true
+		}
+	}
+	return false
+}
+
+// 只有单侧边界的写明范围：下界含边界（min 表示该级及以上），边界以下即便有
+// 未声明范围的兜底规则也必须越界拒绝；边界及以上正常按写明规则判定。
+func TestSensitivityOneSidedRangeBoundary(t *testing.T) {
+	ptr := func(s model.Sensitivity) *model.Sensitivity { return &s }
+	p := model.Policy{
+		Version:     "v-one-sided",
+		EffectiveAt: t0.AddDate(-1, 0, 0),
+		Rules: []model.Rule{
+			{
+				Resources: []string{"res:1"}, Purposes: []string{"research"},
+				MinSensitivity: ptr(model.SensitivityConfidential), // >= confidential
+				Effect:         model.EffectMask,
+				FieldRules:     []model.FieldRule{{Field: "name", Transform: "mask"}},
+			},
+			{Resources: []string{"res:1"}, Purposes: []string{"research"}, Effect: model.EffectAllow},
+		},
+	}
+	e := NewEngine(fakeStore{pols: map[string]model.Policy{"v-one-sided": p}}, func() time.Time { return t0 })
+	cases := []struct {
+		level model.Sensitivity
+		wantD model.Decision
+		wantR model.Reason
+	}{
+		{model.SensitivityPublic, model.DecisionDeny, model.ReasonSensitivityOutOfScope},
+		{model.SensitivityInternal, model.DecisionDeny, model.ReasonSensitivityOutOfScope},
+		{model.SensitivityConfidential, model.DecisionMask, model.ReasonNone}, // 正好压下界
+		{model.SensitivityRestricted, model.DecisionMask, model.ReasonNone},
+	}
+	for _, tc := range cases {
+		rec := &model.Record{Resource: "res:1", Sensitivity: tc.level}
+		d, reason, _, basis := e.Verdict(baseReq(validGrant()), rec)
+		t.Logf("[one-sided level=%s] input={subject=u1 resource=res:1 purpose=research level=%s} "+
+			"matched_rule=%d decision=%d reason=%q factors=%v",
+			tc.level, tc.level, basis.RuleIndex, d, reason, basis.Factors)
+		if d != tc.wantD || reason != tc.wantR {
+			t.Fatalf("level=%s got d=%d reason=%q, want d=%d reason=%q",
+				tc.level, d, reason, tc.wantD, tc.wantR)
+		}
+	}
+}
+
+// 存量策略兼容：同一资源/目的下没有任何规则写明分级范围时，
+// 兜底规则在任意分级（含最高档）结论都与扩展前完全一致。
+func TestAllUnscopedRulesLegacyUnaffected(t *testing.T) {
+	store := fakeStore{pols: map[string]model.Policy{"v1": testPolicy()}} // 全部规则无分级声明
+	e := NewEngine(store, func() time.Time { return t0 })
+	for _, level := range []model.Sensitivity{
+		model.SensitivityPublic, model.SensitivityInternal,
+		model.SensitivityConfidential, model.SensitivityRestricted,
+	} {
+		rec := &model.Record{Resource: "res:1", Sensitivity: level}
+		d, reason, _, basis := e.Verdict(baseReq(validGrant()), rec)
+		t.Logf("[all-unscoped level=%s] decision=%d reason=%q matched_rule=%d factors=%v",
+			level, d, reason, basis.RuleIndex, basis.Factors)
+		if d != model.DecisionMask || reason != model.ReasonNone || basis.RuleIndex != 0 {
+			t.Fatalf("legacy all-unscoped policy changed at level=%s: d=%d reason=%q rule=%d",
+				level, d, reason, basis.RuleIndex)
+		}
+	}
+}
+
+// 目的不符不能被越界理由顶掉：分级虽超出写明范围，但访问目的本来就不匹配，
+// 必须保持 PURPOSE_MISMATCH（授权已覆盖该目的，排除授权侧目的检查）。
+func TestOutOfScopeDoesNotOverridePurposeMismatch(t *testing.T) {
+	store := fakeStore{pols: map[string]model.Policy{"v-mixed": mixedScopePolicy()}}
+	e := NewEngine(store, func() time.Time { return t0 })
+
+	g := validGrant()
+	g.Purposes = []string{"research", "marketing"} // 授权侧覆盖 marketing
+	req := baseReq(g)
+	req.Purpose = "marketing"
+	rec := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityRestricted} // 且分级越界
+
+	d, reason, _, basis := e.Verdict(req, rec)
+	t.Logf("[purpose-vs-scope] input={subject=u1 resource=res:1 purpose=marketing level=restricted} "+
+		"decision=%d reason=%q factors=%v", d, reason, basis.Factors)
+	if d != model.DecisionDeny || reason != model.ReasonPurposeMismatch {
+		t.Fatalf("got d=%d reason=%q, want deny PURPOSE_MISMATCH", d, reason)
+	}
+}
+
+// 写明范围的规则只针对别的目的时，当前目的等于没有分级分段，
+// 未声明范围的规则对当前目的仍按存量语义在任意分级生效。
+func TestScopedRuleForOtherPurposeDoesNotGate(t *testing.T) {
+	ptr := func(s model.Sensitivity) *model.Sensitivity { return &s }
+	p := model.Policy{
+		Version:     "v-other-purpose",
+		EffectiveAt: t0.AddDate(-1, 0, 0),
+		Rules: []model.Rule{
+			{
+				Resources: []string{"res:1"}, Purposes: []string{"billing"},
+				MinSensitivity: ptr(model.SensitivityPublic), MaxSensitivity: ptr(model.SensitivityPublic),
+				Effect: model.EffectDeny,
+			},
+			{Resources: []string{"res:1"}, Purposes: []string{"*"}, Effect: model.EffectAllow},
+		},
+	}
+	e := NewEngine(fakeStore{pols: map[string]model.Policy{"v-other-purpose": p}}, func() time.Time { return t0 })
+	rec := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityRestricted}
+	d, reason, _, basis := e.Verdict(baseReq(validGrant()), rec)
+	t.Logf("[other-purpose-scoped level=restricted] decision=%d reason=%q factors=%v", d, reason, basis.Factors)
+	if d != model.DecisionAllow || reason != model.ReasonNone {
+		t.Fatalf("scoped rule for other purpose must not gate research access: d=%d reason=%q", d, reason)
+	}
+}
+
+// 越界分级下兜底规则无论自身是 allow 还是显式 deny，都统一判
+// SENSITIVITY_OUT_OF_SCOPE：一律拒绝、不返回数据，理由稳定可区分。
+func TestOutOfScopeUnscopedFallbackUniform(t *testing.T) {
+	for _, fallback := range []model.RuleEffect{model.EffectAllow, model.EffectMask, model.EffectDeny} {
+		p := mixedScopePolicy()
+		p.Rules[1].Effect = fallback
+		e := NewEngine(fakeStore{pols: map[string]model.Policy{"v-mixed": p}}, func() time.Time { return t0 })
+
+		rec := &model.Record{Resource: "res:1", Sensitivity: model.SensitivityRestricted}
+		d, reason, _, basis := e.Verdict(baseReq(validGrant()), rec)
+		t.Logf("[unscoped-fallback=%d level=restricted] decision=%d reason=%q factors=%v",
+			fallback, d, reason, basis.Factors)
+		if d != model.DecisionDeny || reason != model.ReasonSensitivityOutOfScope {
+			t.Fatalf("fallback effect=%d: got d=%d reason=%q, want deny SENSITIVITY_OUT_OF_SCOPE",
+				fallback, d, reason)
+		}
+	}
+}

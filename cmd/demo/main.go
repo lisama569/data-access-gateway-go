@@ -44,6 +44,18 @@ func main() {
 				MinSensitivity: ptr(model.SensitivityRestricted), MaxSensitivity: ptr(model.SensitivityRestricted),
 				Effect: model.EffectDeny,
 			},
+			// 漏放路径用例：patient:2002 既有写明分级范围（public..internal 脱敏），
+			// 也有没写分级范围的存量兜底允许（见该资源授权下方演示）。
+			{
+				Resources: []string{"patient:2002"}, Purposes: []string{"research"},
+				MinSensitivity: ptr(model.SensitivityPublic), MaxSensitivity: ptr(model.SensitivityInternal),
+				Effect:     model.EffectMask,
+				FieldRules: []model.FieldRule{{Field: "name", Transform: "mask"}},
+			},
+			{
+				Resources: []string{"patient:2002"}, Purposes: []string{"research"},
+				Effect: model.EffectAllow, // 未声明分级范围的兜底规则
+			},
 		},
 	}
 	if err := store.Publish(p1); err != nil {
@@ -102,4 +114,27 @@ func main() {
 	data.Reclassify("patient:1001", model.SensitivityConfidential, now)
 	resBack, _ := gw.Access(req)
 	fmt.Printf("reclassify back -> confidential: decision=%v reason=%q\n", resBack.Decision, resBack.Reason)
+
+	// 漏放路径演示：patient:2002 的规则已在上方策略中（写明 public..internal
+	// 范围 + 未声明范围的兜底 allow）。该资源授权不设上限——仅由策略覆盖面把关。
+	data.PutRecord(model.Record{
+		ID: "2002", Resource: "patient:2002", Sensitivity: model.SensitivityInternal,
+		Fields: map[string]string{"name": "Bob Li"},
+	})
+	data.PutGrant(model.Grant{
+		ID: "g2", SubjectID: "u-alice", Resource: "patient:2002",
+		Purposes: []string{"research"}, ExpiresAt: now.Add(24 * time.Hour), // 无 MaxSensitivity
+	})
+	req2 := model.AccessRequest{Subject: subject, Resource: "patient:2002", Purpose: "research"}
+
+	// 上边界 internal（闭区间）：按写明范围的规则脱敏。
+	resEdge, _ := gw.Access(req2)
+	fmt.Printf("mixed-policy internal (edge, in scope): decision=%v reason=%q\n", resEdge.Decision, resEdge.Reason)
+
+	// 调高到 confidential，超出所有写明范围：必须 SENSITIVITY_OUT_OF_SCOPE，
+	// 不能落到无范围的兜底 allow 上把数据放出来。
+	data.Reclassify("patient:2002", model.SensitivityConfidential, now)
+	resLeak, _ := gw.Access(req2)
+	fmt.Printf("mixed-policy reclassify -> confidential (out of scope): decision=%v reason=%q (record returned: %v)\n",
+		resLeak.Decision, resLeak.Reason, resLeak.Record != nil)
 }
