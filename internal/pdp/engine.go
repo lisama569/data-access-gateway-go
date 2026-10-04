@@ -11,8 +11,11 @@
 //  5. 目的匹配：授权目的与策略规则目的均须匹配，否则 PURPOSE_MISMATCH。
 //  6. 密级：低于规则要求 CLEARANCE_INSUFFICIENT。
 //  7. 规则分级范围：规则可声明 [MinSensitivity, MaxSensitivity] 适用区间，
-//     数据分级不在区间内的规则被跳过；无任何规则覆盖该分级时
-//     SENSITIVITY_OUT_OF_SCOPE；规则未声明区间则不按分级筛选（存量策略语义不变）。
+//     数据分级不在区间内的规则被跳过。同一「资源+目的」下只要存在写明区间的规则，
+//     未声明区间的规则就不能为落在所有写明区间之外的分级兜底（否则会出现
+//     「分级越高、结论反而越松」的漏放）；此时统一拒绝 SENSITIVITY_OUT_OF_SCOPE。
+//     只有同一「资源+目的」下没有任何规则写明区间（纯存量策略）时，未声明区间的
+//     规则才对所有分级适用，保持存量语义不变。
 //  8. 规则效果：按规则顺序取第一条匹配规则的 deny/mask/allow。
 package pdp
 
@@ -75,6 +78,11 @@ func sensitivityInScope(level model.Sensitivity, min, max *model.Sensitivity) bo
 		return false
 	}
 	return true
+}
+
+// ruleHasSensitivityRange 判断规则是否显式声明了分级适用区间（任一边界非 nil）。
+func ruleHasSensitivityRange(rule model.Rule) bool {
+	return rule.MinSensitivity != nil || rule.MaxSensitivity != nil
 }
 
 // sensitivityRangeText 生成规则分级区间的可读文本，用于判定依据日志。
@@ -183,20 +191,63 @@ func (e *Engine) Verdict(req model.AccessRequest, rec *model.Record) (model.Deci
 	}
 
 	// 规则匹配：按顺序取第一条「资源 + 分级 + 目的」均匹配的规则。
-	// 分级不在规则声明区间内时跳过该规则继续向后找；这样分级超出某条规则
-	// 覆盖范围时不会误命中它后面的允许规则——后者若也不覆盖该分级同样会被跳过，
-	// 最终落到 SENSITIVITY_OUT_OF_SCOPE 拒绝。
+	//
+	// 先按「同资源 + 同目的」预计算写明分级区间的覆盖情况：只要该组合下存在
+	// 写明区间的规则，未声明区间的规则就只在存量语义（该组合下没有任何写明区间）
+	// 下适用；当前分级落在所有写明区间之外时，未声明区间的规则不得兜底放行，
+	// 否则会出现「分级一路调高、结论反而越来越松」的漏放。
+	purposeHasScoped := false
+	levelCovered := false
+	if rec != nil {
+		for _, rule := range p.Rules {
+			if !matchAny(rule.Resources, req.Resource) || !matchAny(rule.Purposes, req.Purpose) {
+				continue
+			}
+			if ruleHasSensitivityRange(rule) {
+				purposeHasScoped = true
+				if sensitivityInScope(rec.Sensitivity, rule.MinSensitivity, rule.MaxSensitivity) {
+					levelCovered = true
+				}
+			}
+		}
+		if purposeHasScoped {
+			basis.Factors = append(basis.Factors,
+				"rule:sensitivity_level="+rec.Sensitivity.String(),
+				"rule:sensitivity_declared_ranges_present",
+			)
+			if levelCovered {
+				basis.Factors = append(basis.Factors, "rule:sensitivity_covered_by_range")
+			} else {
+				basis.Factors = append(basis.Factors,
+					"rule:sensitivity_outside_all_ranges",
+					"rule:unscoped_rules_cannot_backfill",
+				)
+			}
+		}
+	}
+
 	resourceMatched := false
 	for i, rule := range p.Rules {
 		if !matchAny(rule.Resources, req.Resource) {
 			continue
 		}
 		resourceMatched = true
-		if rec != nil && !sensitivityInScope(rec.Sensitivity, rule.MinSensitivity, rule.MaxSensitivity) {
+		if rec != nil && ruleHasSensitivityRange(rule) &&
+			!sensitivityInScope(rec.Sensitivity, rule.MinSensitivity, rule.MaxSensitivity) {
+			// 写明了区间但当前分级不在区间内：跳过该规则继续向后匹配。
 			basis.Factors = append(basis.Factors,
 				"rule:index="+itoa(i),
 				"rule:sensitivity_scope="+sensitivityRangeText(rule.MinSensitivity, rule.MaxSensitivity),
 				"rule:sensitivity_skipped",
+			)
+			continue
+		}
+		if rec != nil && !ruleHasSensitivityRange(rule) && purposeHasScoped && !levelCovered {
+			// 未声明区间的规则不得为「超出所有写明区间」的分级兜底放行。
+			basis.Factors = append(basis.Factors,
+				"rule:index="+itoa(i),
+				"rule:sensitivity_scope=any",
+				"rule:unscoped_backfill_blocked",
 			)
 			continue
 		}

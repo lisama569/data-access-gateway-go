@@ -43,19 +43,19 @@ type Reason string
 
 const (
 	ReasonNone                   Reason = ""
-	ReasonGrantMissing           Reason = "GRANT_MISSING"            // 缺少授权
-	ReasonGrantRevoked           Reason = "GRANT_REVOKED"            // 授权已撤销
-	ReasonPurposeMismatch        Reason = "PURPOSE_MISMATCH"         // 目的不匹配
-	ReasonClearanceInsufficient  Reason = "CLEARANCE_INSUFFICIENT"   // 密级不足
-	ReasonDataRetentionExpired   Reason = "DATA_RETENTION_EXPIRED"   // 数据超出保留期
-	ReasonPolicyRetentionExpired Reason = "POLICY_RETENTION_EXPIRED" // 策略版本超出保留期
-	ReasonNoApplicablePolicy     Reason = "NO_APPLICABLE_POLICY"     // 无可用策略版本
-	ReasonResourceNotFound       Reason = "RESOURCE_NOT_FOUND"       // 资源不存在
-	ReasonMaskConfigInvalid      Reason = "MASK_CONFIG_INVALID"      // 脱敏配置非法或缺失
-	ReasonRuleDenied             Reason = "RULE_DENIED"              // 命中策略规则显式拒绝
+	ReasonGrantMissing           Reason = "GRANT_MISSING"              // 缺少授权
+	ReasonGrantRevoked           Reason = "GRANT_REVOKED"              // 授权已撤销
+	ReasonPurposeMismatch        Reason = "PURPOSE_MISMATCH"           // 目的不匹配
+	ReasonClearanceInsufficient  Reason = "CLEARANCE_INSUFFICIENT"     // 密级不足
+	ReasonDataRetentionExpired   Reason = "DATA_RETENTION_EXPIRED"     // 数据超出保留期
+	ReasonPolicyRetentionExpired Reason = "POLICY_RETENTION_EXPIRED"   // 策略版本超出保留期
+	ReasonNoApplicablePolicy     Reason = "NO_APPLICABLE_POLICY"       // 无可用策略版本
+	ReasonResourceNotFound       Reason = "RESOURCE_NOT_FOUND"         // 资源不存在
+	ReasonMaskConfigInvalid      Reason = "MASK_CONFIG_INVALID"        // 脱敏配置非法或缺失
+	ReasonRuleDenied             Reason = "RULE_DENIED"                // 命中策略规则显式拒绝
 	ReasonGrantSensitivityCap    Reason = "GRANT_SENSITIVITY_EXCEEDED" // 数据分级超过授权覆盖上限
 	ReasonSensitivityOutOfScope  Reason = "SENSITIVITY_OUT_OF_SCOPE"   // 分级无任何策略规则覆盖
-	ReasonInternalError          Reason = "INTERNAL_ERROR"           // 内部错误（细节不透出）
+	ReasonInternalError          Reason = "INTERNAL_ERROR"             // 内部错误（细节不透出）
 )
 
 // Grant 表示主体持有的一条数据授权。
@@ -109,11 +109,16 @@ const (
 // Rule 策略规则：资源 + 目的匹配后的效果与字段规则。
 //
 // 数据分级适用性（兼容存量策略）：
-//   - MinSensitivity 与 MaxSensitivity 同时为 nil 时，规则不按分级筛选，
-//     语义与扩展前完全一致；
+//   - MinSensitivity 与 MaxSensitivity 同时为 nil 时，规则本身不按分级筛选；
 //   - 否则规则只在数据分级落入 [MinSensitivity, MaxSensitivity] 闭区间时适用：
-//     任一边界为 nil 表示该侧不设限。数据分级不在任何规则覆盖范围内时，
-//     判定为 SENSITIVITY_OUT_OF_SCOPE 拒绝，不会落到其他允许规则上放行。
+//     任一边界为 nil 表示该侧不设限；分级正好压在上/下边界时仍按该规则判定。
+//
+// 同一「资源 + 目的」组合下的兜底关系：
+//   - 只要该组合下存在至少一条「写明了分级区间」的规则，数据分级落在所有写明
+//     区间之外时，一律判定为 SENSITIVITY_OUT_OF_SCOPE 拒绝；此时未声明区间的
+//     规则不得为越界分级兜底放行（防止分级调高后反而落到宽松规则上）；
+//   - 只有该组合下没有任何规则写明区间（纯存量策略）时，未声明区间的规则才对
+//     所有分级适用，匹配与结论与扩展前完全一致。
 type Rule struct {
 	Resources      []string
 	Purposes       []string

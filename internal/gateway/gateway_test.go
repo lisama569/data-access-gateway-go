@@ -595,6 +595,244 @@ func TestEndToEndSensitivityOutOfScopeDenied(t *testing.T) {
 	}
 }
 
+// 端到端回归：同一资源+目的下同时存在「写明分级范围的 mask 规则」与「未声明范围的
+// 兜底 allow 规则」时，分级调高到超出所有写明范围后必须拒绝
+// SENSITIVITY_OUT_OF_SCOPE，不能落到兜底规则上放行，且拒绝不返回任何数据内容。
+func TestEndToEndScopedRuleNotBackfilledByUnscoped(t *testing.T) {
+	clock := func() time.Time { return baseTime }
+	store := policy.NewStore()
+	p := model.Policy{
+		Version:     "v-mix",
+		EffectiveAt: baseTime.AddDate(-1, 0, 0),
+		Description: "低分级脱敏；未声明范围的兜底 allow 不得为越界分级放行",
+		Rules: []model.Rule{
+			{
+				Resources: []string{"res:patient-1"}, Purposes: []string{"research"},
+				MinSensitivity: sensPtr(model.SensitivityPublic),
+				MaxSensitivity: sensPtr(model.SensitivityInternal),
+				Effect:         model.EffectMask,
+				FieldRules:     []model.FieldRule{{Field: "name", Transform: "mask"}, {Field: "ssn", Transform: "tokenize", TokenDomain: "hr"}},
+			},
+			// 陷阱兜底：同资源同目的、未声明分级范围、直接明文允许。
+			{
+				Resources: []string{"res:patient-1"}, Purposes: []string{"research"},
+				Effect: model.EffectAllow,
+			},
+		},
+	}
+	if err := store.Publish(p); err != nil {
+		t.Fatal(err)
+	}
+	data := dataset.New(clock)
+	data.PutRecord(model.Record{
+		ID: "patient-1", Resource: "res:patient-1", Sensitivity: model.SensitivityInternal,
+		Fields: map[string]string{"name": "Alice Chen", "ssn": "123-45-6789", "city": "Shanghai"},
+	})
+	data.PutGrant(model.Grant{
+		ID: "g-alice", SubjectID: "u-alice", Resource: "res:patient-1",
+		Purposes: []string{"research"}, ExpiresAt: baseTime.Add(24 * time.Hour),
+	})
+	gw := New(store, data, masking.NewService(), audit.NewLog(), clock)
+
+	// 下边界内（internal）：按第一条规则脱敏，数据返回但 name 已遮蔽。
+	low, lowID := gw.Access(researchReq())
+	logSensitivity(t, "in-scope", model.SensitivityInternal, low, lowID)
+	if low.Decision != model.DecisionMask || low.Reason != model.ReasonNone || low.Record == nil {
+		t.Fatalf("in-scope got d=%d reason=%q", low.Decision, low.Reason)
+	}
+	if low.Record.Fields["name"] != "***REDACTED***" {
+		t.Fatalf("name not masked: %q", low.Record.Fields["name"])
+	}
+
+	// 只重分级到 confidential（超出唯一写明范围）：必须拒绝、无数据。
+	if !data.Reclassify("res:patient-1", model.SensitivityConfidential, baseTime) {
+		t.Fatal("reclassify failed")
+	}
+	mid, midID := gw.Access(researchReq())
+	logSensitivity(t, "out-of-scope", model.SensitivityConfidential, mid, midID)
+	if mid.Decision != model.DecisionDeny || mid.Reason != model.ReasonSensitivityOutOfScope {
+		t.Fatalf("got d=%d reason=%q, want deny SENSITIVITY_OUT_OF_SCOPE", mid.Decision, mid.Reason)
+	}
+	if mid.Record != nil {
+		t.Fatal("out-of-scope deny must not return any record data")
+	}
+	for _, other := range []model.Reason{
+		model.ReasonGrantMissing, model.ReasonGrantRevoked,
+		model.ReasonPurposeMismatch, model.ReasonGrantSensitivityCap, model.ReasonRuleDenied,
+	} {
+		if mid.Reason == other {
+			t.Fatalf("out-of-scope reason must be distinct from %q", other)
+		}
+	}
+
+	// 再升到 restricted 仍然拒绝（结论不会因继续调高而变松）。
+	data.Reclassify("res:patient-1", model.SensitivityRestricted, baseTime)
+	high, highID := gw.Access(researchReq())
+	logSensitivity(t, "out-of-scope-high", model.SensitivityRestricted, high, highID)
+	if high.Decision != model.DecisionDeny || high.Reason != model.ReasonSensitivityOutOfScope || high.Record != nil {
+		t.Fatalf("high got d=%d reason=%q record=%v, want out-of-scope deny without record",
+			high.Decision, high.Reason, high.Record)
+	}
+
+	// 降回范围之内：结论恢复脱敏，证明是分级在主导结论。
+	data.Reclassify("res:patient-1", model.SensitivityPublic, baseTime)
+	back, backID := gw.Access(researchReq())
+	logSensitivity(t, "back-in-scope", model.SensitivityPublic, back, backID)
+	if back.Decision != model.DecisionMask || back.Reason != model.ReasonNone {
+		t.Fatalf("back in scope got d=%d reason=%q, want mask", back.Decision, back.Reason)
+	}
+
+	// 越界那次审计事后按当时分级快照复现，结论必须一致且复现也不返回数据。
+	replayed, err := gw.Replay(midID)
+	if err != nil {
+		t.Fatalf("replay out-of-scope audit: %v", err)
+	}
+	if replayed.Decision != model.DecisionDeny || replayed.Reason != model.ReasonSensitivityOutOfScope {
+		t.Fatalf("replay drifted: d=%d reason=%q", replayed.Decision, replayed.Reason)
+	}
+	if replayed.Record != nil {
+		t.Fatal("replay of deny must not return record data")
+	}
+}
+
+// 并发混合（混合策略）：写明范围的 mask 规则 + 未声明范围的兜底 allow 规则共存。
+// 多写者持续在四个分级间重分级、多读者持续访问：
+//   - 范围内（public/internal）只能是 mask；越界（confidential/restricted）
+//     只能是 SENSITIVITY_OUT_OF_SCOPE 拒绝；任何分级下都绝不允许出现 allow；
+//   - 每条审计事后按其分级快照复现，结论必须与当时完全一致；
+//   - 带 -race 多轮稳定通过。
+func TestConcurrentReclassifyMixedScopedUnscoped(t *testing.T) {
+	clock := func() time.Time { return baseTime }
+	store := policy.NewStore()
+	p := model.Policy{
+		Version:     "v-mix-concurrent",
+		EffectiveAt: baseTime.AddDate(-1, 0, 0),
+		Rules: []model.Rule{
+			{
+				Resources: []string{"res:patient-1"}, Purposes: []string{"research"},
+				MinSensitivity: sensPtr(model.SensitivityPublic),
+				MaxSensitivity: sensPtr(model.SensitivityInternal),
+				Effect:         model.EffectMask,
+				FieldRules:     []model.FieldRule{{Field: "name", Transform: "mask"}},
+			},
+			{
+				Resources: []string{"res:patient-1"}, Purposes: []string{"research"},
+				Effect: model.EffectAllow, // 陷阱兜底：越界分级绝不能落到它上面
+			},
+		},
+	}
+	if err := store.Publish(p); err != nil {
+		t.Fatal(err)
+	}
+	data := dataset.New(clock)
+	data.PutRecord(model.Record{
+		ID: "patient-1", Resource: "res:patient-1", Sensitivity: model.SensitivityConfidential,
+		Fields: map[string]string{"name": "Alice Chen", "ssn": "123-45-6789"},
+	})
+	data.PutGrant(model.Grant{
+		ID: "g-alice", SubjectID: "u-alice", Resource: "res:patient-1",
+		Purposes: []string{"research"}, ExpiresAt: baseTime.Add(24 * time.Hour),
+	})
+	gw := New(store, data, masking.NewService(), audit.NewLog(), clock)
+
+	const writers, readers, perReader = 4, 8, 60
+	levels := []model.Sensitivity{
+		model.SensitivityPublic, model.SensitivityInternal,
+		model.SensitivityConfidential, model.SensitivityRestricted,
+	}
+	inScope := func(l model.Sensitivity) bool { return l <= model.SensitivityInternal }
+
+	var (
+		writerWg, readerWg sync.WaitGroup
+		mu                 sync.Mutex
+		allIDs             []int64
+		seen               = map[model.Reason]int{}
+	)
+	stop := make(chan struct{})
+	for w := 0; w < writers; w++ {
+		w := w
+		writerWg.Add(1)
+		go func() {
+			defer writerWg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+					data.Reclassify("res:patient-1", levels[(i+w)%len(levels)], baseTime)
+					runtime.Gosched()
+				}
+			}
+		}()
+	}
+	for r := 0; r < readers; r++ {
+		readerWg.Add(1)
+		go func() {
+			defer readerWg.Done()
+			ids := make([]int64, 0, perReader)
+			for i := 0; i < perReader; i++ {
+				res, id := gw.Access(researchReq())
+				// 读回本次审计快照里的分级，按它校验结论是否合法。
+				entry, ok := gw.log.Get(id)
+				if !ok {
+					t.Errorf("audit %d missing", id)
+					continue
+				}
+				level := entry.RecordSensitivity
+				switch {
+				case inScope(level):
+					if res.Decision != model.DecisionMask || res.Reason != model.ReasonNone {
+						t.Errorf("in-scope level=%s got d=%d reason=%q, want mask",
+							level, res.Decision, res.Reason)
+					}
+				default:
+					if res.Decision != model.DecisionDeny || res.Reason != model.ReasonSensitivityOutOfScope {
+						t.Errorf("out-of-scope level=%s got d=%d reason=%q, want deny SENSITIVITY_OUT_OF_SCOPE",
+							level, res.Decision, res.Reason)
+					}
+					if res.Record != nil {
+						t.Errorf("out-of-scope level=%s deny must not carry record", level)
+					}
+				}
+				ids = append(ids, id)
+				mu.Lock()
+				seen[res.Reason]++
+				mu.Unlock()
+			}
+			mu.Lock()
+			allIDs = append(allIDs, ids...)
+			mu.Unlock()
+		}()
+	}
+	readerWg.Wait()
+	close(stop)
+	writerWg.Wait()
+
+	mu.Lock()
+	ids := append([]int64(nil), allIDs...)
+	mu.Unlock()
+	if len(ids) != readers*perReader {
+		t.Fatalf("collected %d audits, want %d", len(ids), readers*perReader)
+	}
+	for _, id := range ids {
+		e, ok := gw.log.Get(id)
+		if !ok {
+			t.Fatalf("audit %d missing", id)
+		}
+		replayed, err := gw.Replay(id)
+		if err != nil {
+			t.Fatalf("replay %d: %v", id, err)
+		}
+		if replayed.Decision != e.Decision || replayed.Reason != e.Reason || replayed.PolicyVersion != e.PolicyVersion {
+			t.Fatalf("audit %d drifted: orig=(%d %q %s) replay=(%d %q %s)",
+				id, e.Decision, e.Reason, e.PolicyVersion,
+				replayed.Decision, replayed.Reason, replayed.PolicyVersion)
+		}
+	}
+	t.Logf("[concurrent-mixed-scope] accesses=%d conclusion reasons seen=%v, every audit replayed consistently",
+		len(ids), seen)
+}
+
 // 并发混合：持续重分级与持续访问交错。要求：
 //   - 带 -race 多轮稳定通过（单次判定不会读到撕裂/半新半旧的分级状态）；
 //   - 每次结论只能是当前分级分段策略允许的合法组合；
@@ -608,9 +846,9 @@ func TestConcurrentReclassifyMixedAccess(t *testing.T) {
 	}
 	var (
 		writerWg, readerWg sync.WaitGroup
-		mu                sync.Mutex
-		allIDs            []int64
-		seen              = map[model.Decision]int{}
+		mu                 sync.Mutex
+		allIDs             []int64
+		seen               = map[model.Decision]int{}
 	)
 	stop := make(chan struct{})
 

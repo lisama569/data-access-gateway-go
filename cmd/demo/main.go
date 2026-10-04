@@ -44,6 +44,19 @@ func main() {
 				MinSensitivity: ptr(model.SensitivityRestricted), MaxSensitivity: ptr(model.SensitivityRestricted),
 				Effect: model.EffectDeny,
 			},
+			// 混合分级范围演示（同策略版本内的另一资源 patient:1002）：
+			// 一条写明 public..internal 的 mask 规则 + 一条未声明分级范围的 allow 兜底。
+			// 兜底只在本「资源+目的」没有写明范围的存量语义下适用；越界分级必须被拒绝。
+			{
+				Resources: []string{"patient:1002"}, Purposes: []string{"research"},
+				MinSensitivity: ptr(model.SensitivityPublic), MaxSensitivity: ptr(model.SensitivityInternal),
+				Effect:     model.EffectMask,
+				FieldRules: []model.FieldRule{{Field: "name", Transform: "mask"}},
+			},
+			{
+				Resources: []string{"patient:1002"}, Purposes: []string{"research"},
+				Effect: model.EffectAllow,
+			},
 		},
 	}
 	if err := store.Publish(p1); err != nil {
@@ -64,6 +77,15 @@ func main() {
 		ID: "g1", SubjectID: "u-alice", Resource: "patient:1001",
 		Purposes: []string{"research"}, ExpiresAt: now.Add(24 * time.Hour),
 		MaxSensitivity: &capLevel,
+	})
+	data.PutRecord(model.Record{
+		ID: "1002", Resource: "patient:1002", Sensitivity: model.SensitivityInternal,
+		ExpiresAt: now.AddDate(1, 0, 0),
+		Fields:    map[string]string{"name": "Bob Wang"},
+	})
+	data.PutGrant(model.Grant{
+		ID: "g2", SubjectID: "u-alice", Resource: "patient:1002",
+		Purposes: []string{"research"}, ExpiresAt: now.Add(24 * time.Hour),
 	})
 
 	svc := masking.NewService()
@@ -102,4 +124,25 @@ func main() {
 	data.Reclassify("patient:1001", model.SensitivityConfidential, now)
 	resBack, _ := gw.Access(req)
 	fmt.Printf("reclassify back -> confidential: decision=%v reason=%q\n", resBack.Decision, resBack.Reason)
+
+	// 混合策略资源：范围内（internal）按写明的 mask 规则脱敏，兜底 allow 不参与。
+	req2 := model.AccessRequest{Subject: subject, Resource: "patient:1002", Purpose: "research"}
+	resMix, mixID := gw.Access(req2)
+	fmt.Printf("mixed-policy in-scope (internal): decision=%v reason=%q fields=%v\n",
+		resMix.Decision, resMix.Reason, resMix.Record.Fields)
+
+	// 升到 confidential：超出唯一写明范围，无范围兜底 allow 不得放行 ->
+	// SENSITIVITY_OUT_OF_SCOPE 拒绝，且结果不带任何数据。
+	data.Reclassify("patient:1002", model.SensitivityConfidential, now)
+	resMixHigh, _ := gw.Access(req2)
+	fmt.Printf("mixed-policy out-of-scope (confidential): decision=%v reason=%q data_returned=%v\n",
+		resMixHigh.Decision, resMixHigh.Reason, resMixHigh.Record != nil)
+
+	// 范围内那次访问的审计可按当时 internal 分级快照复现出 mask 结论。
+	replayedMixInScope, err := gw.Replay(mixID)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("replay mixed-policy in-scope entry %d: decision=%v reason=%q (sensitivity snapshot=internal)\n",
+		mixID, replayedMixInScope.Decision, replayedMixInScope.Reason)
 }
